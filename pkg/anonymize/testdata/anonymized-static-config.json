@@ -201,7 +201,6 @@
         "endpointWaitTime": "42ns"
       },
       "prefix": "MyPrefix",
-      "refreshInterval": "42ns",
       "requireConsistent": true,
       "stale": true,
       "cache": true,

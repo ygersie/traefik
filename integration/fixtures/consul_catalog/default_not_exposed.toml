@@ -15,6 +15,5 @@
 [providers]
   [providers.consulCatalog]
     exposedByDefault = false
-    refreshInterval = "500ms"
   [providers.consulCatalog.endpoint]
     address = "{{ .ConsulAddress }}"

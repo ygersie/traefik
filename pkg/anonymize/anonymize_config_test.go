@@ -676,7 +676,6 @@ func TestDo_staticConfiguration(t *testing.T) {
 			EndpointWaitTime: 42,
 		},
 		Prefix:            "MyPrefix",
-		RefreshInterval:   42,
 		RequireConsistent: true,
 		Stale:             true,
 		Cache:             true,

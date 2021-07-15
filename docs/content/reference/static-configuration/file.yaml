@@ -149,7 +149,6 @@ providers:
   consulCatalog:
     constraints: foobar
     prefix: foobar
-    refreshInterval: 42s
     requireConsistent: true
     stale: true
     cache: true

@@ -42,7 +42,6 @@ type Provider struct {
 	Constraints       string          `description:"Constraints is an expression that Traefik matches against the container's labels to determine whether to create any route for that container." json:"constraints,omitempty" toml:"constraints,omitempty" yaml:"constraints,omitempty" export:"true"`
 	Endpoint          *EndpointConfig `description:"Consul endpoint settings" json:"endpoint,omitempty" toml:"endpoint,omitempty" yaml:"endpoint,omitempty" export:"true"`
 	Prefix            string          `description:"Prefix for consul service tags. Default 'traefik'" json:"prefix,omitempty" toml:"prefix,omitempty" yaml:"prefix,omitempty" export:"true"`
-	RefreshInterval   ptypes.Duration `description:"Interval for check Consul API. Default 15s" json:"refreshInterval,omitempty" toml:"refreshInterval,omitempty" yaml:"refreshInterval,omitempty" export:"true"`
 	RequireConsistent bool            `description:"Forces the read to be fully consistent." json:"requireConsistent,omitempty" toml:"requireConsistent,omitempty" yaml:"requireConsistent,omitempty" export:"true"`
 	Stale             bool            `description:"Use stale consistency for catalog reads." json:"stale,omitempty" toml:"stale,omitempty" yaml:"stale,omitempty" export:"true"`
 	Cache             bool            `description:"Use local agent caching for catalog reads." json:"cache,omitempty" toml:"cache,omitempty" yaml:"cache,omitempty" export:"true"`
@@ -51,6 +50,8 @@ type Provider struct {
 
 	client         *api.Client
 	defaultRuleTpl *template.Template
+
+	lastIndex uint64 // last read modify index from catalog
 }
 
 // EndpointConfig holds configurations of the endpoint.
@@ -80,7 +81,6 @@ func (p *Provider) SetDefaults() {
 	endpoint := &EndpointConfig{}
 	endpoint.SetDefaults()
 	p.Endpoint = endpoint
-	p.RefreshInterval = ptypes.Duration(15 * time.Second)
 	p.Prefix = "traefik"
 	p.ExposedByDefault = true
 	p.DefaultRule = DefaultTemplateRule
@@ -111,26 +111,13 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 				return fmt.Errorf("unable to create consul client: %w", err)
 			}
 
-			// get configuration at the provider's startup.
-			err = p.loadConfiguration(routineCtx, configurationChan)
-			if err != nil {
-				return fmt.Errorf("failed to get consul catalog data: %w", err)
-			}
-
-			// Periodic refreshes.
-			ticker := time.NewTicker(time.Duration(p.RefreshInterval))
-			defer ticker.Stop()
-
 			for {
-				select {
-				case <-ticker.C:
-					err = p.loadConfiguration(routineCtx, configurationChan)
-					if err != nil {
-						return fmt.Errorf("failed to refresh consul catalog data: %w", err)
+				err = p.loadConfiguration(routineCtx, configurationChan)
+				if err != nil {
+					if routineCtx.Err() == context.Canceled {
+						return nil
 					}
-
-				case <-routineCtx.Done():
-					return nil
+					return fmt.Errorf("failed to get consul catalog data: %w", err)
 				}
 			}
 		}
@@ -141,7 +128,7 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 
 		err := backoff.RetryNotify(safe.OperationWithRecover(operation), backoff.WithContext(job.NewBackOff(backoff.NewExponentialBackOff()), ctxLog), notify)
 		if err != nil {
-			logger.Errorf("Cannot connect to consul catalog server %+v", err)
+			logger.Errorf("Cannot connect to consul catalog server: %+v", err)
 		}
 	})
 
@@ -246,43 +233,83 @@ func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.Catalo
 func (p *Provider) fetchServices(ctx context.Context) ([]string, error) {
 	// The query option "Filter" is not supported by /catalog/services.
 	// https://www.consul.io/api/catalog.html#list-services
-	opts := &api.QueryOptions{AllowStale: p.Stale, RequireConsistent: p.RequireConsistent, UseCache: p.Cache}
-	serviceNames, _, err := p.client.Catalog().Services(opts)
-	if err != nil {
-		return nil, err
+	opts := &api.QueryOptions{
+		AllowStale:        p.Stale,
+		RequireConsistent: p.RequireConsistent,
+		UseCache:          p.Cache,
+		WaitTime:          5 * time.Minute,
+		WaitIndex:         p.lastIndex,
 	}
+	opts = opts.WithContext(ctx)
 
-	// The keys are the service names, and the array values provide all known tags for a given service.
-	// https://www.consul.io/api/catalog.html#list-services
-	var filtered []string
-	for svcName, tags := range serviceNames {
-		logger := log.FromContext(log.With(ctx, log.Str("serviceName", svcName)))
+	var backoff time.Duration
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
 
-		if !p.ExposedByDefault && !contains(tags, p.Prefix+".enable=true") {
-			logger.Debug("Filtering disabled item")
-			continue
+		case <-time.After(backoff):
+			serviceNames, meta, err := p.client.Catalog().Services(opts)
+			if err != nil {
+				return nil, err
+			}
+
+			// set default backoff to 1 second
+			backoff = time.Second
+
+			// https://www.consul.io/api-docs/features/blocking
+			switch {
+			case p.lastIndex == meta.LastIndex:
+				log.FromContext(ctx).Debugf("Catalog index (%v) has not changed", meta.LastIndex)
+				// no need to backoff, the WaitTime will block the call accordingly
+				backoff = 0
+				continue
+			case meta.LastIndex == 0:
+				log.FromContext(ctx).Warn("Catalog query returned index 0, this should not happen")
+				p.lastIndex = 1
+				continue
+			case meta.LastIndex < p.lastIndex:
+				log.FromContext(ctx).Warn("Catalog returned smaller index than stored, resetting to index 0")
+				p.lastIndex = 0
+				continue
+			}
+
+			p.lastIndex = meta.LastIndex
+			log.FromContext(ctx).Debugf("Catalog updated to index: %v", meta.LastIndex)
+
+			// The keys are the service names, and the array values provide all known tags for a given service.
+			// https://www.consul.io/api/catalog.html#list-services
+			var filtered []string
+			for svcName, tags := range serviceNames {
+				logger := log.FromContext(log.With(ctx, log.Str("serviceName", svcName)))
+
+				if !p.ExposedByDefault && !contains(tags, p.Prefix+".enable=true") {
+					logger.Debug("Filtering disabled item")
+					continue
+				}
+
+				if contains(tags, p.Prefix+".enable=false") {
+					logger.Debug("Filtering disabled item")
+					continue
+				}
+
+				matches, err := constraints.MatchTags(tags, p.Constraints)
+				if err != nil {
+					logger.Errorf("Error matching constraints expression: %v", err)
+					continue
+				}
+
+				if !matches {
+					logger.Debugf("Container pruned by constraint expression: %q", p.Constraints)
+					continue
+				}
+
+				filtered = append(filtered, svcName)
+			}
+
+			return filtered, err
 		}
-
-		if contains(tags, p.Prefix+".enable=false") {
-			logger.Debug("Filtering disabled item")
-			continue
-		}
-
-		matches, err := constraints.MatchTags(tags, p.Constraints)
-		if err != nil {
-			logger.Errorf("Error matching constraints expression: %v", err)
-			continue
-		}
-
-		if !matches {
-			logger.Debugf("Container pruned by constraint expression: %q", p.Constraints)
-			continue
-		}
-
-		filtered = append(filtered, svcName)
 	}
-
-	return filtered, err
 }
 
 func contains(values []string, val string) bool {

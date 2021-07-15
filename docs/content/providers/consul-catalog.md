@@ -38,30 +38,6 @@ See the dedicated section in [routing](../routing/providers/consul-catalog.md).
 
 ## Provider Configuration
 
-### `refreshInterval`
-
-_Optional, Default=15s_
-
-Defines the polling interval.
-
-```yaml tab="File (YAML)"
-providers:
-  consulCatalog:
-    refreshInterval: 30s
-    # ...
-```
-
-```toml tab="File (TOML)"
-[providers.consulCatalog]
-  refreshInterval = "30s"
-  # ...
-```
-
-```bash tab="CLI"
---providers.consulcatalog.refreshInterval=30s
-# ...
-```
-
 ### `prefix`
 
 _required, Default="traefik"_
